@@ -6,7 +6,7 @@ use std::path::Path;
 
 ///The find_partial_matches special function to search partial matches in a CSV file using a customizable regular expression.
 /// The function returns a list of all partial matches found.
-fn find_partial_matches(file_path: &str, regex_pattern: &str) -> Result<Vec<String>, Box<dyn Error>> {
+pub fn find_partial_matches(file_path: &str, regex_pattern: &str) -> Result<Vec<String>, Box<dyn Error>> {
     let file_extension = Path::new(file_path).extension().and_then(|ext| ext.to_str());
     if file_extension != Some("csv") {
         return Err("The file is not a valid CSV file".into());
