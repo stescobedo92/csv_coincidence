@@ -29,3 +29,58 @@ fn find_partial_matches(file_path: &str, regex_pattern: &str) -> Result<Vec<Stri
 
     Ok(partial_matches)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_find_partial_matches() {
+        let file_path = "test_data.csv";
+        let regex_pattern = r"^[A-Z][a-z]*";
+
+        let matches = find_partial_matches(file_path, regex_pattern).unwrap();
+        let mut expected_matches_results = Vec::<String>::new();
+
+        expected_matches_results.push("Jhon".to_string());
+        expected_matches_results.push("Marta".to_string());
+
+        assert_eq!(expected_matches_results, matches);
+    }
+
+    #[test]
+    fn test_find_partial_matches_invalid_file() {
+        let file_path = "test_data.txt";
+        let regex_pattern = r"^[A-Z][a-z]*";
+
+        let result = find_partial_matches(file_path, regex_pattern);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_find_partial_matches_no_matches() {
+        let file_path = "test_data.csv";
+        let regex_pattern = r"^[0-9]+";
+
+        let matches = find_partial_matches(file_path, regex_pattern).unwrap();
+        assert_eq!(matches, Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_find_partial_matches_empty_file() {
+        let file_path = "empty.csv";
+        let regex_pattern = r"^[A-Z][a-z]*";
+
+        let matches = find_partial_matches(file_path, regex_pattern).unwrap();
+        assert_eq!(matches, Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_find_partial_matches_empty_regex() {
+        let file_path = "test_data.csv";
+        let regex_pattern = r"";  // Empty regular expression
+
+        let result = find_partial_matches(file_path, regex_pattern);
+        assert!(result.is_err());
+    }
+}
