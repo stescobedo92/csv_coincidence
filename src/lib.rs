@@ -59,6 +59,61 @@ pub fn find_partial_matches(file_path: &str, regex_pattern: &str) -> Result<Vec<
     Ok(partial_matches)
 }
 
+/// Counts the number of occurrences of a specific pattern in the CSV file.
+///
+/// # Arguments
+///
+/// * `file_path` - A string slice representing the file path to the input CSV file.
+/// * `pattern` - A string slice representing the regular expression pattern to match against the CSV records.
+///
+/// # Returns
+///
+/// A `Result` containing the count of occurrences if successful, or an error message if there is any issue during processing.
+///
+/// # Errors
+///
+/// Returns an error if the file is not a valid CSV file or if there is an issue with the regular expression pattern.
+///
+/// # Example
+///
+/// ```
+/// use std::error::Error;
+/// use csv_coincidence::count_coincidences;
+///
+/// fn main() -> Result<(), Box<dyn Error>> {
+///     let file_path = "example.csv";
+///     let pattern = r"\bexample\b"; // Regular expression pattern to match against the CSV records.
+///
+///     match count_coincidences(file_path, pattern) {
+///         Ok(count) => {
+///             println!("Number of occurrences: {}", count);
+///             Ok(())
+///         }
+///         Err(err) => Err(err.into()),
+///     }
+/// }
+/// ```
+pub fn count_coincidences(file_path: &str, patron: &str) -> Result<usize, Box<dyn Error>> {
+    validate_csv_extension(file_path);
+
+    let re = Regex::new(patron)?;
+
+    let file = File::open(file_path)?;
+    let mut rdr = ReaderBuilder::new().has_headers(true).from_reader(file);
+
+    let mut contador = 0;
+    for result in rdr.records() {
+        let record = result?;
+        for field in record.iter() {
+            if re.is_match(field) {
+                contador += 1;
+            }
+        }
+    }
+
+    Ok(contador)
+}
+
 /// Merges the records in a CSV file that match a specific pattern and replaces those matches with "[MERGED]".
 ///
 /// # Arguments
