@@ -59,6 +59,75 @@ pub fn find_partial_matches(file_path: &str, regex_pattern: &str) -> Result<Vec<
     Ok(partial_matches)
 }
 
+/// Merges the records in a CSV file that match a specific pattern and replaces those matches with "[MERGED]".
+///
+/// # Arguments
+///
+/// * `file_path` - A string slice representing the file path to the input CSV file.
+/// * `pattern` - A string slice representing the regular expression pattern to match against the CSV records.
+///
+/// # Returns
+///
+/// A `Result` containing a `String` with the merged CSV data if successful, or an error message if there is any issue during processing.
+///
+/// # Errors
+///
+/// Returns an error if the file is not a valid CSV file or if there is an issue with the regular expression pattern.
+///
+/// # Example
+///
+/// ```
+/// use std::error::Error;
+/// use csv_coincidence::merge_coincidence;
+///
+/// fn main() -> Result<(), Box<dyn Error>> {
+///     let file_path = "example.csv";
+///     let pattern = r"\bmerge\b"; // Regular expression pattern to match against the CSV records.
+///
+///     match merge_coincidence(file_path, pattern) {
+///         Ok(merged_data) => {
+///             println!("Merged CSV data:\n{}", merged_data);
+///             Ok(())
+///         }
+///         Err(err) => Err(err.into()),
+///     }
+/// }
+/// ```
+pub fn merge_coincidence(file_path: &str, patron: &str) -> Result<String, Box<dyn Error>> {
+    validate_csv_extension(file_path);
+
+    let re = Regex::new(patron)?;
+    let file = File::open(file_path)?;
+    let mut rdr = ReaderBuilder::new().has_headers(true).from_reader(file);
+    let mut merged_data: Vec<Vec<String>> = Vec::new();
+
+    for result in rdr.records() {
+        let record = result?;
+        let mut merged_record: Vec<String> = Vec::new();
+        let mut merged = false;
+
+        for field in record.iter() {
+            if re.is_match(field) {
+                merged_record.push("[MERGED]".to_string());
+                merged = true;
+            } else {
+                merged_record.push(field.to_string());
+            }
+        }
+
+        if merged {
+            merged_data.push(merged_record);
+        }
+    }
+
+    let mut wtr = WriterBuilder::new().from_writer(vec![]);
+    for record in merged_data {
+        wtr.write_record(&record)?;
+    }
+
+    Ok(String::from_utf8(wtr.into_inner()?)?)
+}
+
 /// Validates if the given file path has a ".csv" extension.
 ///
 /// # Arguments
