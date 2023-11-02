@@ -1,10 +1,10 @@
 [package]
 name = "csv_coincidence"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Sergio Triana Escobedo <stescobedo.31@gmail.com>"]
 license = "MIT OR Apache-2.0"
-description = "A simple smart pointer implementation in Rust."
+description = "Tool designed to efficiently search for and identify specific patterns within CSV files"
 homepage = "https://github.com/stescobedo92/csv_coincidence"
 repository = "https://github.com/stescobedo92/csv_coincidence"
 readme = "README.md"
