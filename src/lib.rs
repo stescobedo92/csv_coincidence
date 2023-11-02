@@ -1,16 +1,45 @@
-use csv::Reader;
+use csv::{Reader, ReaderBuilder, WriterBuilder};
 use regex::Regex;
 use std::error::Error;
 use std::fs::File;
 use std::path::Path;
 
-///The find_partial_matches special function to search partial matches in a CSV file using a customizable regular expression.
-/// The function returns a list of all partial matches found.
+/// Finds partial matches in the CSV file based on the given regular expression pattern.
+///
+/// # Arguments
+///
+/// * `file_path` - A string slice representing the file path to the input CSV file.
+/// * `regex_pattern` - A string slice representing the regular expression pattern to match against the CSV records.
+///
+/// # Returns
+///
+/// A `Result` containing a vector of strings with the partial matches if successful, or an error message if there is any issue during processing.
+///
+/// # Errors
+///
+/// Returns an error if the file is not a valid CSV file or if there is an issue with the regular expression pattern.
+///
+/// # Example
+///
+/// ```
+/// use std::error::Error;
+/// use csv_coincidence::find_partial_matches;
+///
+/// fn main() -> Result<(), Box<dyn Error>> {
+///     let file_path = "example.csv";
+///     let regex_pattern = r"\bpartial\b"; // Regular expression pattern to match against the CSV records.
+///
+///     match find_partial_matches(file_path, regex_pattern) {
+///         Ok(partial_matches) => {
+///             println!("Partial matches found: {:?}", partial_matches);
+///             Ok(())
+///         }
+///         Err(err) => Err(err.into()),
+///     }
+/// }
+/// ```
 pub fn find_partial_matches(file_path: &str, regex_pattern: &str) -> Result<Vec<String>, Box<dyn Error>> {
-    let file_extension = Path::new(file_path).extension().and_then(|ext| ext.to_str());
-    if file_extension != Some("csv") {
-        return Err("The file is not a valid CSV file".into());
-    }
+    validate_csv_extension(file_path);
 
     let file = File::open(file_path)?;
     let mut rdr = Reader::from_reader(file);
@@ -28,6 +57,27 @@ pub fn find_partial_matches(file_path: &str, regex_pattern: &str) -> Result<Vec<
     }
 
     Ok(partial_matches)
+}
+
+/// Validates if the given file path has a ".csv" extension.
+///
+/// # Arguments
+///
+/// * `file_path` - A string slice representing the file path to be validated.
+///
+/// # Returns
+///
+/// A `Result` containing `Ok(())` if the file has a valid CSV extension, or an error message if the extension is not valid.
+///
+fn validate_csv_extension(file_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let file_extension = Path::new(file_path)
+        .extension()
+        .and_then(|ext| ext.to_str());
+
+    match file_extension {
+        Some("csv") => Ok(()),
+        _ => Err("The file is not a valid CSV file".into()),
+    }
 }
 
 #[cfg(test)]
