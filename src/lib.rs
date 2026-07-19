@@ -1,260 +1,233 @@
-use csv::{Reader, ReaderBuilder, WriterBuilder};
-use regex::Regex;
-use std::error::Error;
-use std::fs::File;
+//! # csv_coincidence
+//!
+//! Search, count, filter, replace, and report pattern matches inside CSV files.
+//!
+//! The crate exposes both a library API and an optional CLI binary
+//! (`csv-coincidence`, feature `cli`).
+
+mod engine;
+mod error;
+mod export;
+mod match_result;
+mod options;
+
+pub use engine::{
+    build_reader, build_report, count_matches_reader, dedupe_rows_reader, filter_rows_reader,
+    find_matches_reader, open_reader_from_path, replace_matches_reader, scan_stats_reader,
+    write_output,
+};
+pub use error::{CsvCoincidenceError, Result};
+pub use export::{export_hits, export_report, ExportFormat};
+pub use match_result::{MatchHit, PatternCount, ScanReport, ValueCount};
+pub use options::{ColumnSelector, CsvOptions, MatchMode, ReplaceOptions, SearchOptions};
+
+use std::io::Read;
 use std::path::Path;
 
-/// Finds partial matches in the CSV file based on the given regular expression pattern.
+/// Find partial matches in a CSV file path using a single regex pattern.
 ///
-/// # Arguments
-///
-/// * `file_path` - A string slice representing the file path to the input CSV file.
-/// * `regex_pattern` - A string slice representing the regular expression pattern to match against the CSV records.
-///
-/// # Returns
-///
-/// A `Result` containing a vector of strings with the partial matches if successful, or an error message if there is any issue during processing.
-///
-/// # Errors
-///
-/// Returns an error if the file is not a valid CSV file or if there is an issue with the regular expression pattern.
-///
-/// # Example
-///
-/// ```
-/// use std::error::Error;
-/// use csv_coincidence::find_partial_matches;
-///
-/// fn main() -> Result<(), Box<dyn Error>> {
-///     let file_path = "example.csv";
-///     let regex_pattern = r"\bpartial\b"; // Regular expression pattern to match against the CSV records.
-///
-///     match find_partial_matches(file_path, regex_pattern) {
-///         Ok(partial_matches) => {
-///             println!("Partial matches found: {:?}", partial_matches);
-///             Ok(())
-///         }
-///         Err(err) => Err(err.into()),
-///     }
-/// }
-/// ```
-pub fn find_partial_matches(file_path: &str, regex_pattern: &str) -> Result<Vec<String>, Box<dyn Error>> {
-    validate_csv_extension(file_path);
-
-    let file = File::open(file_path)?;
-    let mut rdr = Reader::from_reader(file);
-
-    let re = Regex::new(regex_pattern)?;
-    let mut partial_matches = Vec::new();
-
-    for result in rdr.records() {
-        let record = result?;
-        for field in record.iter() {
-            if re.is_match(field) {
-                partial_matches.push(field.to_string());
-            }
-        }
-    }
-
-    Ok(partial_matches)
+/// Convenience wrapper around [`find_matches`] that returns only field values.
+pub fn find_partial_matches(file_path: &str, regex_pattern: &str) -> Result<Vec<String>> {
+    let hits = find_matches(file_path, SearchOptions::new([regex_pattern]))?;
+    Ok(hits.into_iter().map(|h| h.value).collect())
 }
 
-/// Counts the number of occurrences of a specific pattern in the CSV file.
-///
-/// # Arguments
-///
-/// * `file_path` - A string slice representing the file path to the input CSV file.
-/// * `pattern` - A string slice representing the regular expression pattern to match against the CSV records.
-///
-/// # Returns
-///
-/// A `Result` containing the count of occurrences if successful, or an error message if there is any issue during processing.
-///
-/// # Errors
-///
-/// Returns an error if the file is not a valid CSV file or if there is an issue with the regular expression pattern.
-///
-/// # Example
-///
-/// ```
-/// use std::error::Error;
-/// use csv_coincidence::count_coincidences;
-///
-/// fn main() -> Result<(), Box<dyn Error>> {
-///     let file_path = "example.csv";
-///     let pattern = r"\bexample\b"; // Regular expression pattern to match against the CSV records.
-///
-///     match count_coincidences(file_path, pattern) {
-///         Ok(count) => {
-///             println!("Number of occurrences: {}", count);
-///             Ok(())
-///         }
-///         Err(err) => Err(err.into()),
-///     }
-/// }
-/// ```
-pub fn count_coincidences(file_path: &str, patron: &str) -> Result<usize, Box<dyn Error>> {
-    validate_csv_extension(file_path);
-
-    let re = Regex::new(patron)?;
-
-    let file = File::open(file_path)?;
-    let mut rdr = ReaderBuilder::new().has_headers(true).from_reader(file);
-
-    let mut contador = 0;
-    for result in rdr.records() {
-        let record = result?;
-        for field in record.iter() {
-            if re.is_match(field) {
-                contador += 1;
-            }
-        }
-    }
-
-    Ok(contador)
+/// Count occurrences of a pattern in a CSV file path.
+pub fn count_coincidences(file_path: &str, pattern: &str) -> Result<usize> {
+    count_matches(file_path, SearchOptions::new([pattern]))
 }
 
-/// Merges the records in a CSV file that match a specific pattern and replaces those matches with "[MERGED]".
+/// Replace matching fields with `[MERGED]` and keep only matched rows.
 ///
-/// # Arguments
-///
-/// * `file_path` - A string slice representing the file path to the input CSV file.
-/// * `pattern` - A string slice representing the regular expression pattern to match against the CSV records.
-///
-/// # Returns
-///
-/// A `Result` containing a `String` with the merged CSV data if successful, or an error message if there is any issue during processing.
-///
-/// # Errors
-///
-/// Returns an error if the file is not a valid CSV file or if there is an issue with the regular expression pattern.
-///
-/// # Example
-///
-/// ```
-/// use std::error::Error;
-/// use csv_coincidence::merge_coincidence;
-///
-/// fn main() -> Result<(), Box<dyn Error>> {
-///     let file_path = "example.csv";
-///     let pattern = r"\bmerge\b"; // Regular expression pattern to match against the CSV records.
-///
-///     match merge_coincidence(file_path, pattern) {
-///         Ok(merged_data) => {
-///             println!("Merged CSV data:\n{}", merged_data);
-///             Ok(())
-///         }
-///         Err(err) => Err(err.into()),
-///     }
-/// }
-/// ```
-pub fn merge_coincidence(file_path: &str, patron: &str) -> Result<String, Box<dyn Error>> {
-    validate_csv_extension(file_path);
-
-    let re = Regex::new(patron)?;
-    let file = File::open(file_path)?;
-    let mut rdr = ReaderBuilder::new().has_headers(true).from_reader(file);
-    let mut merged_data: Vec<Vec<String>> = Vec::new();
-
-    for result in rdr.records() {
-        let record = result?;
-        let mut merged_record: Vec<String> = Vec::new();
-        let mut merged = false;
-
-        for field in record.iter() {
-            if re.is_match(field) {
-                merged_record.push("[MERGED]".to_string());
-                merged = true;
-            } else {
-                merged_record.push(field.to_string());
-            }
-        }
-
-        if merged {
-            merged_data.push(merged_record);
-        }
-    }
-
-    let mut wtr = WriterBuilder::new().from_writer(vec![]);
-    for record in merged_data {
-        wtr.write_record(&record)?;
-    }
-
-    Ok(String::from_utf8(wtr.into_inner()?)?)
+/// Prefer [`replace_matches`] for custom replacement text and options.
+pub fn merge_coincidence(file_path: &str, pattern: &str) -> Result<String> {
+    replace_matches(
+        file_path,
+        ReplaceOptions::new([pattern], "[MERGED]").keep_headers(false),
+    )
 }
 
-/// Validates if the given file path has a ".csv" extension.
-///
-/// # Arguments
-///
-/// * `file_path` - A string slice representing the file path to be validated.
-///
-/// # Returns
-///
-/// A `Result` containing `Ok(())` if the file has a valid CSV extension, or an error message if the extension is not valid.
-///
-fn validate_csv_extension(file_path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let file_extension = Path::new(file_path)
-        .extension()
-        .and_then(|ext| ext.to_str());
+/// Find matches from a file path.
+pub fn find_matches(file_path: impl AsRef<Path>, options: SearchOptions) -> Result<Vec<MatchHit>> {
+    let reader = open_reader_from_path(file_path.as_ref(), &options)?;
+    find_matches_reader(reader, &options)
+}
 
-    match file_extension {
-        Some("csv") => Ok(()),
-        _ => Err("The file is not a valid CSV file".into()),
-    }
+/// Find matches from any `Read` source (file, stdin buffer, memory).
+pub fn find_matches_from_read<R: Read>(reader: R, options: SearchOptions) -> Result<Vec<MatchHit>> {
+    let csv_reader = build_reader(reader, &options);
+    find_matches_reader(csv_reader, &options)
+}
+
+/// Count matches from a file path.
+pub fn count_matches(file_path: impl AsRef<Path>, options: SearchOptions) -> Result<usize> {
+    let reader = open_reader_from_path(file_path.as_ref(), &options)?;
+    count_matches_reader(reader, &options)
+}
+
+/// Filter rows from a file path.
+pub fn filter_rows(
+    file_path: impl AsRef<Path>,
+    options: SearchOptions,
+    keep_matches: bool,
+) -> Result<String> {
+    let reader = open_reader_from_path(file_path.as_ref(), &options)?;
+    filter_rows_reader(reader, &options, keep_matches)
+}
+
+/// Replace matches from a file path.
+pub fn replace_matches(file_path: impl AsRef<Path>, options: ReplaceOptions) -> Result<String> {
+    let reader = open_reader_from_path(file_path.as_ref(), &options.search)?;
+    replace_matches_reader(reader, &options)
+}
+
+/// Produce a scan report from a file path.
+pub fn report_matches(file_path: impl AsRef<Path>, options: SearchOptions) -> Result<ScanReport> {
+    let reader = open_reader_from_path(file_path.as_ref(), &options)?;
+    let (hits, rows, fields) = scan_stats_reader(reader, &options)?;
+    Ok(build_report(&hits, rows, fields))
+}
+
+/// Deduplicate rows from a file path using matched-column fingerprints.
+pub fn dedupe_rows(file_path: impl AsRef<Path>, options: SearchOptions) -> Result<String> {
+    let reader = open_reader_from_path(file_path.as_ref(), &options)?;
+    dedupe_rows_reader(reader, &options)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
 
-    #[test]
-    fn test_find_partial_matches() {
-        let file_path = "test_data.csv";
-        let regex_pattern = r"^[A-Z][a-z]*";
-
-        let matches = find_partial_matches(file_path, regex_pattern).unwrap();
-        let mut expected_matches_results = Vec::<String>::new();
-
-        expected_matches_results.push("Jhon".to_string());
-        expected_matches_results.push("Marta".to_string());
-
-        assert_eq!(expected_matches_results, matches);
+    fn sample_csv() -> NamedTempFile {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "name,city,email\nJhon,Madrid,jhon@example.com\nMarta,Berlin,marta@test.org\nanna,Paris,anna@example.com\nJhon,Madrid,jhon@example.com"
+        )
+        .unwrap();
+        file
     }
 
     #[test]
-    fn test_find_partial_matches_invalid_file() {
-        let file_path = "test_data.txt";
-        let regex_pattern = r"^[A-Z][a-z]*";
+    fn finds_partial_matches() {
+        let file = sample_csv();
+        let path = file.path().with_extension("csv");
+        std::fs::copy(file.path(), &path).unwrap();
 
-        let result = find_partial_matches(file_path, regex_pattern);
-        assert!(result.is_err());
+        let matches = find_partial_matches(path.to_str().unwrap(), r"^[A-Z][a-z]*").unwrap();
+        assert!(matches.contains(&"Jhon".to_string()));
+        assert!(matches.contains(&"Marta".to_string()));
+        assert!(matches.contains(&"Madrid".to_string()));
+        assert!(matches.contains(&"Berlin".to_string()));
+        assert!(matches.contains(&"Paris".to_string()));
     }
 
     #[test]
-    fn test_find_partial_matches_no_matches() {
-        let file_path = "test_data.csv";
-        let regex_pattern = r"^[0-9]+";
-
-        let matches = find_partial_matches(file_path, regex_pattern).unwrap();
-        assert_eq!(matches, Vec::<String>::new());
+    fn rejects_invalid_extension() {
+        let err = find_partial_matches("test_data.txt", r"^[A-Z][a-z]*").unwrap_err();
+        assert!(matches!(err, CsvCoincidenceError::InvalidExtension(_)));
     }
 
     #[test]
-    fn test_find_partial_matches_empty_file() {
-        let file_path = "empty.csv";
-        let regex_pattern = r"^[A-Z][a-z]*";
+    fn counts_and_reports_with_column_filter() {
+        let file = sample_csv();
+        let path = file.path().with_extension("csv");
+        std::fs::copy(file.path(), &path).unwrap();
 
-        let matches = find_partial_matches(file_path, regex_pattern).unwrap();
-        assert_eq!(matches, Vec::<String>::new());
+        let options = SearchOptions::new([r"example\.com"])
+            .columns(ColumnSelector::Names(vec!["email".into()]));
+        let count = count_matches(&path, options.clone()).unwrap();
+        assert_eq!(count, 3);
+
+        let report = report_matches(&path, options).unwrap();
+        assert_eq!(report.total_matches, 3);
+        assert!(report.columns_touched.contains(&"email".to_string()));
     }
 
     #[test]
-    fn test_find_partial_matches_empty_regex() {
-        let file_path = "test_data.csv";
-        let regex_pattern = r"";  // Empty regular expression
+    fn replaces_with_custom_text() {
+        let file = sample_csv();
+        let path = file.path().with_extension("csv");
+        std::fs::copy(file.path(), &path).unwrap();
 
-        let result = find_partial_matches(file_path, regex_pattern);
-        assert!(result.is_err());
+        let out = replace_matches(
+            &path,
+            ReplaceOptions::new([r"@.*"], "[REDACTED]")
+                .search(
+                    SearchOptions::new([r"@.*"])
+                        .columns(ColumnSelector::Names(vec!["email".into()])),
+                )
+                .only_matched_rows(false),
+        )
+        .unwrap();
+
+        assert!(out.contains("[REDACTED]"));
+        assert!(out.contains("name,city,email"));
+    }
+
+    #[test]
+    fn filters_and_dedupes() {
+        let file = sample_csv();
+        let path = file.path().with_extension("csv");
+        std::fs::copy(file.path(), &path).unwrap();
+
+        let options = SearchOptions::new(["Jhon"]);
+        let filtered = filter_rows(&path, options.clone(), true).unwrap();
+        assert_eq!(filtered.lines().count(), 3); // header + 2 Jhon rows
+
+        let deduped = dedupe_rows(&path, options).unwrap();
+        assert_eq!(deduped.lines().count(), 4); // header + 3 unique rows
+    }
+
+    #[test]
+    fn fuzzy_match_works() {
+        let file = sample_csv();
+        let path = file.path().with_extension("csv");
+        std::fs::copy(file.path(), &path).unwrap();
+
+        let options = SearchOptions::new(["John"])
+            .mode(MatchMode::Fuzzy { threshold: 0.5 })
+            .columns(ColumnSelector::Names(vec!["name".into()]));
+        let hits = find_matches(&path, options).unwrap();
+        assert!(!hits.is_empty());
+        assert!(hits.iter().any(|h| h.value == "Jhon"));
+    }
+
+    #[test]
+    fn reads_from_memory() {
+        let data = b"id,name\n1,Alpha\n2,Beta\n";
+        let options = SearchOptions::new([r"^A"]);
+        let hits = find_matches_from_read(&data[..], options).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].value, "Alpha");
+    }
+
+    #[test]
+    fn merge_coincidence_compat() {
+        let file = sample_csv();
+        let path = file.path().with_extension("csv");
+        std::fs::copy(file.path(), &path).unwrap();
+
+        let merged = merge_coincidence(path.to_str().unwrap(), r"^Jhon$").unwrap();
+        assert!(merged.contains("[MERGED]"));
+        assert!(!merged.contains("name,city,email"));
+    }
+
+    #[test]
+    fn exports_json_and_csv() {
+        let hits = vec![MatchHit {
+            row: 1,
+            column_index: 0,
+            column_name: Some("name".into()),
+            value: "Jhon".into(),
+            pattern: "Jhon".into(),
+            score: None,
+        }];
+        let json = export_hits(&hits, ExportFormat::Json).unwrap();
+        assert!(json.contains("Jhon"));
+        let csv = export_hits(&hits, ExportFormat::Csv).unwrap();
+        assert!(csv.contains("row,column_index"));
     }
 }
