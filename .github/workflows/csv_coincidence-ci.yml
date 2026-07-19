@@ -2,21 +2,39 @@ name: Rust
 
 on:
   push:
-    branches: [ "master" ]
+    branches: ["master", "main", "develop"]
   pull_request:
-    branches: [ "master" ]
+    branches: ["master", "main", "develop"]
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v3
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Build
+        run: cargo build --verbose --all-features
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo test --verbose --all-features
+
+      - name: CLI smoke test
+        run: |
+          cargo run --features cli -- find -i tests/fixtures/test_data.csv -p '^[A-Z]' -c name -f json | head -c 200
