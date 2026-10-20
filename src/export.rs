@@ -37,15 +37,13 @@ pub fn export_hits(hits: &[MatchHit], format: ExportFormat) -> Result<String> {
                     .column_name
                     .clone()
                     .unwrap_or_else(|| format!("col_{}", h.column_index));
+                let base = format!(
+                    "row={} column={} value={:?} matched={:?} span={}..{} pattern={:?}",
+                    h.row, col, h.value, h.matched_text, h.start, h.end, h.pattern
+                );
                 match h.score {
-                    Some(score) => format!(
-                        "row={} column={} value={:?} pattern={:?} score={:.3}",
-                        h.row, col, h.value, h.pattern, score
-                    ),
-                    None => format!(
-                        "row={} column={} value={:?} pattern={:?}",
-                        h.row, col, h.value, h.pattern
-                    ),
+                    Some(score) => format!("{base} score={score:.3}"),
+                    None => base,
                 }
             })
             .collect::<Vec<_>>()
@@ -94,6 +92,9 @@ fn hits_to_delimited(hits: &[MatchHit], delimiter: u8) -> Result<String> {
         "column_index",
         "column_name",
         "value",
+        "matched_text",
+        "start",
+        "end",
         "pattern",
         "score",
     ])?;
@@ -103,6 +104,9 @@ fn hits_to_delimited(hits: &[MatchHit], delimiter: u8) -> Result<String> {
             hit.column_index.to_string(),
             hit.column_name.clone().unwrap_or_default(),
             hit.value.clone(),
+            hit.matched_text.clone(),
+            hit.start.to_string(),
+            hit.end.to_string(),
             hit.pattern.clone(),
             hit.score.map(|s| format!("{s:.6}")).unwrap_or_default(),
         ])?;

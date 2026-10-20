@@ -10,17 +10,28 @@ mod error;
 mod export;
 mod match_result;
 mod options;
+mod patterns;
 
 pub use engine::{
-    build_reader, build_report, count_matches_reader, dedupe_rows_reader, filter_rows_reader,
-    find_matches_reader, open_reader_from_path, replace_matches_reader, scan_stats_reader,
-    write_output,
+    build_reader, build_report, count_matches_reader, dedupe_rows_reader, dedupe_rows_to_writer,
+    filter_rows_reader, filter_rows_to_writer, find_matches_iter_reader, find_matches_reader,
+    open_reader_from_path, replace_matches_reader, replace_matches_to_writer, scan_stats_reader,
+    write_output, MatchHitIter,
 };
 pub use error::{CsvCoincidenceError, Result};
 pub use export::{export_hits, export_report, ExportFormat};
 pub use match_result::{MatchHit, PatternCount, ScanReport, ValueCount};
-pub use options::{ColumnSelector, CsvOptions, MatchMode, ReplaceOptions, SearchOptions};
+pub use options::{
+    ColumnRule, ColumnSelector, CsvOptions, LogicOp, MatchMode, ReplaceOptions, SearchOptions,
+};
+pub use patterns::{
+    builtin_pattern, builtin_patterns, is_valid_credit_card, is_valid_dni, is_valid_iban,
+    is_valid_nie, parse_patterns, read_pattern_file, CREDIT_CARD_PATTERN, DATE_ISO_PATTERN,
+    DNI_PATTERN, EMAIL_PATTERN, IBAN_PATTERN, IPV4_PATTERN, NIE_PATTERN, PHONE_ES_PATTERN,
+    URL_PATTERN, UUID_PATTERN,
+};
 
+use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
@@ -57,6 +68,24 @@ pub fn find_matches(file_path: impl AsRef<Path>, options: SearchOptions) -> Resu
 pub fn find_matches_from_read<R: Read>(reader: R, options: SearchOptions) -> Result<Vec<MatchHit>> {
     let csv_reader = build_reader(reader, &options);
     find_matches_reader(csv_reader, &options)
+}
+
+/// Stream matches from a file path without materialising all hits.
+pub fn find_matches_iter(
+    file_path: impl AsRef<Path>,
+    options: SearchOptions,
+) -> Result<MatchHitIter<File>> {
+    let reader = open_reader_from_path(file_path.as_ref(), &options)?;
+    find_matches_iter_reader(reader, &options)
+}
+
+/// Stream matches from any `Read` source without materialising all hits.
+pub fn find_matches_iter_from_read<R: Read>(
+    reader: R,
+    options: SearchOptions,
+) -> Result<MatchHitIter<R>> {
+    let csv_reader = build_reader(reader, &options);
+    find_matches_iter_reader(csv_reader, &options)
 }
 
 /// Count matches from a file path.
@@ -110,12 +139,16 @@ mod tests {
         file
     }
 
-    #[test]
-    fn finds_partial_matches() {
+    fn sample_path() -> (NamedTempFile, std::path::PathBuf) {
         let file = sample_csv();
         let path = file.path().with_extension("csv");
         std::fs::copy(file.path(), &path).unwrap();
+        (file, path)
+    }
 
+    #[test]
+    fn finds_partial_matches() {
+        let (_file, path) = sample_path();
         let matches = find_partial_matches(path.to_str().unwrap(), r"^[A-Z][a-z]*").unwrap();
         assert!(matches.contains(&"Jhon".to_string()));
         assert!(matches.contains(&"Marta".to_string()));
@@ -132,10 +165,7 @@ mod tests {
 
     #[test]
     fn counts_and_reports_with_column_filter() {
-        let file = sample_csv();
-        let path = file.path().with_extension("csv");
-        std::fs::copy(file.path(), &path).unwrap();
-
+        let (_file, path) = sample_path();
         let options = SearchOptions::new([r"example\.com"])
             .columns(ColumnSelector::Names(vec!["email".into()]));
         let count = count_matches(&path, options.clone()).unwrap();
@@ -148,10 +178,7 @@ mod tests {
 
     #[test]
     fn replaces_with_custom_text() {
-        let file = sample_csv();
-        let path = file.path().with_extension("csv");
-        std::fs::copy(file.path(), &path).unwrap();
-
+        let (_file, path) = sample_path();
         let out = replace_matches(
             &path,
             ReplaceOptions::new([r"@.*"], "[REDACTED]")
@@ -162,17 +189,13 @@ mod tests {
                 .only_matched_rows(false),
         )
         .unwrap();
-
         assert!(out.contains("[REDACTED]"));
         assert!(out.contains("name,city,email"));
     }
 
     #[test]
     fn filters_and_dedupes() {
-        let file = sample_csv();
-        let path = file.path().with_extension("csv");
-        std::fs::copy(file.path(), &path).unwrap();
-
+        let (_file, path) = sample_path();
         let options = SearchOptions::new(["Jhon"]);
         let filtered = filter_rows(&path, options.clone(), true).unwrap();
         assert_eq!(filtered.lines().count(), 3); // header + 2 Jhon rows
@@ -183,10 +206,7 @@ mod tests {
 
     #[test]
     fn fuzzy_match_works() {
-        let file = sample_csv();
-        let path = file.path().with_extension("csv");
-        std::fs::copy(file.path(), &path).unwrap();
-
+        let (_file, path) = sample_path();
         let options = SearchOptions::new(["John"])
             .mode(MatchMode::Fuzzy { threshold: 0.5 })
             .columns(ColumnSelector::Names(vec!["name".into()]));
@@ -206,10 +226,7 @@ mod tests {
 
     #[test]
     fn merge_coincidence_compat() {
-        let file = sample_csv();
-        let path = file.path().with_extension("csv");
-        std::fs::copy(file.path(), &path).unwrap();
-
+        let (_file, path) = sample_path();
         let merged = merge_coincidence(path.to_str().unwrap(), r"^Jhon$").unwrap();
         assert!(merged.contains("[MERGED]"));
         assert!(!merged.contains("name,city,email"));
@@ -224,10 +241,15 @@ mod tests {
             value: "Jhon".into(),
             pattern: "Jhon".into(),
             score: None,
+            matched_text: "Jhon".into(),
+            start: 0,
+            end: 4,
+            captures: Vec::new(),
         }];
         let json = export_hits(&hits, ExportFormat::Json).unwrap();
         assert!(json.contains("Jhon"));
         let csv = export_hits(&hits, ExportFormat::Csv).unwrap();
         assert!(csv.contains("row,column_index"));
+        assert!(csv.contains("matched_text"));
     }
 }

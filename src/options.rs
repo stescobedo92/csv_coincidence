@@ -72,6 +72,62 @@ pub enum MatchMode {
     Fuzzy { threshold: f64 },
 }
 
+/// How multiple [`ColumnRule`]s combine when evaluating a row.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LogicOp {
+    /// Every rule must be satisfied.
+    #[default]
+    And,
+    /// At least one rule must be satisfied.
+    Or,
+}
+
+/// A pattern set scoped to specific columns.
+///
+/// A rule is satisfied in a row when at least one selected field matches at
+/// least one pattern. When `negated` is set, the rule is satisfied instead
+/// when no selected field matches.
+#[derive(Debug, Clone)]
+pub struct ColumnRule {
+    pub columns: ColumnSelector,
+    /// One or more patterns (regex, substring, or fuzzy target).
+    pub patterns: Vec<String>,
+    pub mode: MatchMode,
+    pub case_insensitive: bool,
+    /// Invert this rule's row-level condition.
+    pub negated: bool,
+}
+
+impl ColumnRule {
+    pub fn new(
+        columns: ColumnSelector,
+        patterns: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            columns,
+            patterns: patterns.into_iter().map(Into::into).collect(),
+            mode: MatchMode::Regex,
+            case_insensitive: false,
+            negated: false,
+        }
+    }
+
+    pub fn mode(mut self, mode: MatchMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    pub fn case_insensitive(mut self, value: bool) -> Self {
+        self.case_insensitive = value;
+        self
+    }
+
+    pub fn negated(mut self, value: bool) -> Self {
+        self.negated = value;
+        self
+    }
+}
+
 /// Search / transform configuration.
 #[derive(Debug, Clone)]
 pub struct SearchOptions {
@@ -82,6 +138,11 @@ pub struct SearchOptions {
     pub patterns: Vec<String>,
     /// Case-insensitive matching (regex / contains).
     pub case_insensitive: bool,
+    /// Per-column rules. When non-empty, they take precedence over the
+    /// global `columns`/`patterns`/`mode`/`case_insensitive` fields.
+    pub column_rules: Vec<ColumnRule>,
+    /// How `column_rules` combine when evaluating a row.
+    pub logic: LogicOp,
 }
 
 impl Default for SearchOptions {
@@ -92,6 +153,8 @@ impl Default for SearchOptions {
             mode: MatchMode::Regex,
             patterns: Vec::new(),
             case_insensitive: false,
+            column_rules: Vec::new(),
+            logic: LogicOp::And,
         }
     }
 }
@@ -100,6 +163,15 @@ impl SearchOptions {
     pub fn new(patterns: impl IntoIterator<Item = impl Into<String>>) -> Self {
         Self {
             patterns: patterns.into_iter().map(Into::into).collect(),
+            ..Self::default()
+        }
+    }
+
+    /// Build options from per-column rules combined with `logic`.
+    pub fn with_rules(rules: impl IntoIterator<Item = ColumnRule>, logic: LogicOp) -> Self {
+        Self {
+            column_rules: rules.into_iter().collect(),
+            logic,
             ..Self::default()
         }
     }
@@ -121,6 +193,21 @@ impl SearchOptions {
 
     pub fn case_insensitive(mut self, value: bool) -> Self {
         self.case_insensitive = value;
+        self
+    }
+
+    pub fn add_rule(mut self, rule: ColumnRule) -> Self {
+        self.column_rules.push(rule);
+        self
+    }
+
+    pub fn rules(mut self, rules: impl IntoIterator<Item = ColumnRule>) -> Self {
+        self.column_rules = rules.into_iter().collect();
+        self
+    }
+
+    pub fn logic(mut self, logic: LogicOp) -> Self {
+        self.logic = logic;
         self
     }
 }

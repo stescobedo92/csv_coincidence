@@ -15,6 +15,18 @@ pub struct MatchHit {
     pub pattern: String,
     /// Optional similarity score for fuzzy matches (0.0–1.0).
     pub score: Option<f64>,
+    /// Matched fragment inside `value`.
+    #[serde(default)]
+    pub matched_text: String,
+    /// Byte offset where `matched_text` starts inside `value`.
+    #[serde(default)]
+    pub start: usize,
+    /// Byte offset where `matched_text` ends inside `value`.
+    #[serde(default)]
+    pub end: usize,
+    /// Regex capture groups `1..N` (empty for other modes).
+    #[serde(default)]
+    pub captures: Vec<Option<String>>,
 }
 
 /// Aggregate report for a scan.
