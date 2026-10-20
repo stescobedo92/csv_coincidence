@@ -1,17 +1,49 @@
 use crate::error::{CsvCoincidenceError, Result};
 use crate::match_result::{MatchHit, PatternCount, ScanReport, ValueCount};
-use crate::options::{ColumnSelector, MatchMode, ReplaceOptions, SearchOptions};
+use crate::options::{
+    ColumnRule, ColumnSelector, LogicOp, MatchMode, ReplaceOptions, SearchOptions,
+};
 use csv::{Reader, ReaderBuilder, StringRecord, Writer, WriterBuilder};
 use regex::{Regex, RegexBuilder};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 use strsim::normalized_levenshtein;
 
-pub(crate) struct CompiledPattern {
-    pub raw: String,
-    pub regex: Option<Regex>,
+struct CompiledPattern {
+    raw: String,
+    regex: Option<Regex>,
+}
+
+struct FieldMatch {
+    score: f64,
+    start: usize,
+    end: usize,
+    matched_text: String,
+    captures: Vec<Option<String>>,
+}
+
+enum ColumnIndices {
+    All,
+    Fixed(Vec<usize>),
+}
+
+struct CompiledRule {
+    indices: ColumnIndices,
+    patterns: Vec<CompiledPattern>,
+    mode: MatchMode,
+    case_insensitive: bool,
+    negated: bool,
+}
+
+impl CompiledRule {
+    fn indices_for(&self, record_len: usize) -> Vec<usize> {
+        match &self.indices {
+            ColumnIndices::All => (0..record_len).collect(),
+            ColumnIndices::Fixed(indices) => indices.clone(),
+        }
+    }
 }
 
 pub(crate) fn validate_csv_extension(path: &Path) -> Result<()> {
@@ -21,35 +53,94 @@ pub(crate) fn validate_csv_extension(path: &Path) -> Result<()> {
     }
 }
 
-pub(crate) fn compile_patterns(options: &SearchOptions) -> Result<Vec<CompiledPattern>> {
-    if options.patterns.is_empty() {
+fn validate_mode(mode: &MatchMode) -> Result<()> {
+    if let MatchMode::Fuzzy { threshold } = mode {
+        if !(0.0..=1.0).contains(threshold) {
+            return Err(CsvCoincidenceError::Message(format!(
+                "fuzzy threshold must be between 0.0 and 1.0, got {threshold}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Normalise options into rules: explicit `column_rules`, or one legacy
+/// rule built from the global fields.
+fn effective_rules(options: &SearchOptions) -> Vec<ColumnRule> {
+    if options.column_rules.is_empty() {
+        vec![ColumnRule {
+            columns: options.columns.clone(),
+            patterns: options.patterns.clone(),
+            mode: options.mode.clone(),
+            case_insensitive: options.case_insensitive,
+            negated: false,
+        }]
+    } else {
+        options.column_rules.clone()
+    }
+}
+
+fn compile_rule(
+    rule: &ColumnRule,
+    headers: &StringRecord,
+    has_headers: bool,
+) -> Result<CompiledRule> {
+    if rule.patterns.is_empty() {
         return Err(CsvCoincidenceError::Message(
             "at least one pattern is required".into(),
         ));
     }
+    validate_mode(&rule.mode)?;
 
-    let mut compiled = Vec::with_capacity(options.patterns.len());
-    for pattern in &options.patterns {
+    let mut patterns = Vec::with_capacity(rule.patterns.len());
+    for pattern in &rule.patterns {
         if pattern.is_empty() {
             return Err(CsvCoincidenceError::Message(
                 "pattern must not be empty".into(),
             ));
         }
-        let regex = match options.mode {
-            MatchMode::Regex => {
-                let re = RegexBuilder::new(pattern)
-                    .case_insensitive(options.case_insensitive)
-                    .build()?;
-                Some(re)
-            }
+        let regex = match rule.mode {
+            MatchMode::Regex => Some(
+                RegexBuilder::new(pattern)
+                    .case_insensitive(rule.case_insensitive)
+                    .build()?,
+            ),
             MatchMode::Contains | MatchMode::Fuzzy { .. } => None,
         };
-        compiled.push(CompiledPattern {
+        patterns.push(CompiledPattern {
             raw: pattern.clone(),
             regex,
         });
     }
-    Ok(compiled)
+
+    let indices = if has_headers {
+        ColumnIndices::Fixed(resolve_column_indices(headers, &rule.columns)?)
+    } else {
+        match &rule.columns {
+            ColumnSelector::All => ColumnIndices::All,
+            ColumnSelector::Indices(indices) => ColumnIndices::Fixed(indices.clone()),
+            ColumnSelector::Names(names) => {
+                return Err(CsvCoincidenceError::Message(format!(
+                    "column names require headers; got {names:?}"
+                )));
+            }
+        }
+    };
+
+    Ok(CompiledRule {
+        indices,
+        patterns,
+        mode: rule.mode.clone(),
+        case_insensitive: rule.case_insensitive,
+        negated: rule.negated,
+    })
+}
+
+fn compile_rules(options: &SearchOptions, headers: &StringRecord) -> Result<Vec<CompiledRule>> {
+    effective_rules(options)
+        .iter()
+        .map(|rule| compile_rule(rule, headers, options.csv.has_headers))
+        .collect()
 }
 
 pub fn open_reader_from_path(path: &Path, options: &SearchOptions) -> Result<Reader<File>> {
@@ -71,17 +162,25 @@ pub fn build_reader<R: Read>(reader: R, options: &SearchOptions) -> Reader<R> {
         .from_reader(reader)
 }
 
+fn read_headers<R: Read>(reader: &mut Reader<R>, options: &SearchOptions) -> Result<StringRecord> {
+    if options.csv.has_headers {
+        Ok(reader.headers()?.clone())
+    } else {
+        Ok(StringRecord::new())
+    }
+}
+
+fn build_writer<W: Write>(writer: W, options: &SearchOptions) -> Writer<W> {
+    WriterBuilder::new()
+        .delimiter(options.csv.delimiter)
+        .quote(options.csv.quote)
+        .from_writer(writer)
+}
+
 fn resolve_column_indices(headers: &StringRecord, selector: &ColumnSelector) -> Result<Vec<usize>> {
     match selector {
         ColumnSelector::All => Ok((0..headers.len()).collect()),
-        ColumnSelector::Indices(indices) => {
-            for &idx in indices {
-                if idx >= headers.len() && !headers.is_empty() {
-                    // When headers are disabled, header record length may still reflect first row.
-                }
-            }
-            Ok(indices.clone())
-        }
+        ColumnSelector::Indices(indices) => Ok(indices.clone()),
         ColumnSelector::Names(names) => {
             let mut resolved = Vec::new();
             for name in names {
@@ -96,41 +195,64 @@ fn resolve_column_indices(headers: &StringRecord, selector: &ColumnSelector) -> 
     }
 }
 
-fn field_matches(field: &str, pattern: &CompiledPattern, options: &SearchOptions) -> Option<f64> {
-    match &options.mode {
+fn field_match(
+    field: &str,
+    pattern: &CompiledPattern,
+    mode: &MatchMode,
+    case_insensitive: bool,
+) -> Option<FieldMatch> {
+    match mode {
         MatchMode::Regex => {
             let re = pattern.regex.as_ref()?;
-            if re.is_match(field) {
-                Some(1.0)
-            } else {
-                None
-            }
+            let captures = re.captures(field)?;
+            let whole = captures.get(0)?;
+            Some(FieldMatch {
+                score: 1.0,
+                start: whole.start(),
+                end: whole.end(),
+                matched_text: whole.as_str().to_string(),
+                captures: captures
+                    .iter()
+                    .skip(1)
+                    .map(|group| group.map(|m| m.as_str().to_string()))
+                    .collect(),
+            })
         }
         MatchMode::Contains => {
-            let hay = if options.case_insensitive {
-                field.to_lowercase()
+            let (haystack, needle) = if case_insensitive {
+                (field.to_lowercase(), pattern.raw.to_lowercase())
+            } else {
+                (field.to_string(), pattern.raw.clone())
+            };
+            let start = haystack.find(&needle)?;
+            let end = start + needle.len();
+            let matched_text = if field.is_char_boundary(start) && field.is_char_boundary(end) {
+                field[start..end].to_string()
             } else {
                 field.to_string()
             };
-            let needle = if options.case_insensitive {
-                pattern.raw.to_lowercase()
-            } else {
-                pattern.raw.clone()
-            };
-            if hay.contains(&needle) {
-                Some(1.0)
-            } else {
-                None
-            }
+            Some(FieldMatch {
+                score: 1.0,
+                start,
+                end,
+                matched_text,
+                captures: Vec::new(),
+            })
         }
         MatchMode::Fuzzy { threshold } => {
-            let score = if options.case_insensitive {
+            let score = if case_insensitive {
                 normalized_levenshtein(&field.to_lowercase(), &pattern.raw.to_lowercase())
             } else {
                 normalized_levenshtein(field, &pattern.raw)
             };
             if score >= *threshold {
-                Some(score)
+                Some(FieldMatch {
+                    score,
+                    start: 0,
+                    end: field.len(),
+                    matched_text: field.to_string(),
+                    captures: Vec::new(),
+                })
             } else {
                 None
             }
@@ -141,10 +263,11 @@ fn field_matches(field: &str, pattern: &CompiledPattern, options: &SearchOptions
 fn replace_field(
     field: &str,
     pattern: &CompiledPattern,
-    options: &SearchOptions,
+    mode: &MatchMode,
+    case_insensitive: bool,
     replacement: &str,
 ) -> Option<String> {
-    match &options.mode {
+    match mode {
         MatchMode::Regex => {
             let re = pattern.regex.as_ref()?;
             if re.is_match(field) {
@@ -154,32 +277,28 @@ fn replace_field(
             }
         }
         MatchMode::Contains => {
-            if field_matches(field, pattern, options).is_some() {
-                if options.case_insensitive {
-                    // Case-insensitive replace of all occurrences.
-                    let lower = field.to_lowercase();
-                    let needle = pattern.raw.to_lowercase();
-                    let mut out = String::new();
-                    let mut last = 0;
-                    let mut start = 0;
-                    while let Some(pos) = lower[start..].find(&needle) {
-                        let abs = start + pos;
-                        out.push_str(&field[last..abs]);
-                        out.push_str(replacement);
-                        last = abs + needle.len();
-                        start = last;
-                    }
-                    out.push_str(&field[last..]);
-                    Some(out)
-                } else {
-                    Some(field.replace(&pattern.raw, replacement))
+            field_match(field, pattern, mode, case_insensitive)?;
+            if case_insensitive {
+                let lower = field.to_lowercase();
+                let needle = pattern.raw.to_lowercase();
+                let mut out = String::new();
+                let mut last = 0;
+                let mut start = 0;
+                while let Some(pos) = lower[start..].find(&needle) {
+                    let abs = start + pos;
+                    out.push_str(&field[last..abs]);
+                    out.push_str(replacement);
+                    last = abs + needle.len();
+                    start = last;
                 }
+                out.push_str(&field[last..]);
+                Some(out)
             } else {
-                None
+                Some(field.replace(&pattern.raw, replacement))
             }
         }
         MatchMode::Fuzzy { .. } => {
-            if field_matches(field, pattern, options).is_some() {
+            if field_match(field, pattern, mode, case_insensitive).is_some() {
                 Some(replacement.to_string())
             } else {
                 None
@@ -188,219 +307,282 @@ fn replace_field(
     }
 }
 
-/// Stream matches from any CSV reader.
-pub fn find_matches_reader<R: Read>(
+fn combine(satisfied: &[bool], logic: LogicOp) -> bool {
+    match logic {
+        LogicOp::And => satisfied.iter().all(|&s| s),
+        LogicOp::Or => satisfied.iter().any(|&s| s),
+    }
+}
+
+/// Hits from non-negated rules, but only when the combined row condition
+/// holds. With `strict`, an out-of-range fixed column index is an error.
+fn evaluate_row_hits(
+    record: &StringRecord,
+    headers: &StringRecord,
+    row: usize,
+    rules: &[CompiledRule],
+    logic: LogicOp,
+    strict: bool,
+) -> Result<Vec<MatchHit>> {
+    let mut satisfied = Vec::with_capacity(rules.len());
+    let mut hits = Vec::new();
+
+    for rule in rules {
+        let mut any_match = false;
+        for col_idx in rule.indices_for(record.len()) {
+            if col_idx >= record.len() {
+                if strict {
+                    return Err(CsvCoincidenceError::InvalidColumnIndex(col_idx));
+                }
+                continue;
+            }
+            let value = record.get(col_idx).unwrap_or("");
+            for pattern in &rule.patterns {
+                if let Some(found) = field_match(value, pattern, &rule.mode, rule.case_insensitive)
+                {
+                    any_match = true;
+                    if !rule.negated {
+                        hits.push(MatchHit {
+                            row,
+                            column_index: col_idx,
+                            column_name: headers.get(col_idx).map(str::to_string),
+                            value: value.to_string(),
+                            pattern: pattern.raw.clone(),
+                            score: match rule.mode {
+                                MatchMode::Fuzzy { .. } => Some(found.score),
+                                _ => None,
+                            },
+                            matched_text: found.matched_text,
+                            start: found.start,
+                            end: found.end,
+                            captures: found.captures,
+                        });
+                    }
+                }
+            }
+        }
+        satisfied.push(any_match != rule.negated);
+    }
+
+    if combine(&satisfied, logic) {
+        Ok(hits)
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+/// Row-level boolean evaluation without building hits.
+fn evaluate_row_bool(record: &StringRecord, rules: &[CompiledRule], logic: LogicOp) -> bool {
+    let mut satisfied = Vec::with_capacity(rules.len());
+    for rule in rules {
+        let mut any_match = false;
+        for col_idx in rule.indices_for(record.len()) {
+            let Some(value) = record.get(col_idx) else {
+                continue;
+            };
+            if rule
+                .patterns
+                .iter()
+                .any(|p| field_match(value, p, &rule.mode, rule.case_insensitive).is_some())
+            {
+                any_match = true;
+                break;
+            }
+        }
+        satisfied.push(any_match != rule.negated);
+    }
+    combine(&satisfied, logic)
+}
+
+/// Streaming iterator over matches, reading one CSV record at a time.
+pub struct MatchHitIter<R: Read> {
+    reader: Reader<R>,
+    headers: StringRecord,
+    rules: Vec<CompiledRule>,
+    logic: LogicOp,
+    row: usize,
+    pending: VecDeque<MatchHit>,
+    exhausted: bool,
+}
+
+/// Create a streaming match iterator from any CSV reader.
+///
+/// Patterns, rules and column names are validated up front; row-level
+/// errors (malformed CSV, invalid column index) surface as iterator items.
+pub fn find_matches_iter_reader<R: Read>(
     mut reader: Reader<R>,
     options: &SearchOptions,
-) -> Result<Vec<MatchHit>> {
-    let patterns = compile_patterns(options)?;
-    let headers = if options.csv.has_headers {
-        reader.headers()?.clone()
-    } else {
-        StringRecord::new()
-    };
+) -> Result<MatchHitIter<R>> {
+    let headers = read_headers(&mut reader, options)?;
+    let rules = compile_rules(options, &headers)?;
+    Ok(MatchHitIter {
+        reader,
+        headers,
+        rules,
+        logic: options.logic,
+        row: 0,
+        pending: VecDeque::new(),
+        exhausted: false,
+    })
+}
 
-    // When there are no headers, infer width from the first record lazily.
-    let mut column_indices = if options.csv.has_headers {
-        resolve_column_indices(&headers, &options.columns)?
-    } else {
-        match &options.columns {
-            ColumnSelector::All => Vec::new(), // filled per-record
-            ColumnSelector::Indices(indices) => indices.clone(),
-            ColumnSelector::Names(names) => {
-                return Err(CsvCoincidenceError::Message(format!(
-                    "column names require headers; got {:?}",
-                    names
-                )));
-            }
-        }
-    };
+impl<R: Read> Iterator for MatchHitIter<R> {
+    type Item = Result<MatchHit>;
 
-    let mut hits = Vec::new();
-    for (row_idx, result) in reader.records().enumerate() {
-        let record = result?;
-        if !options.csv.has_headers {
-            if let ColumnSelector::All = options.columns {
-                column_indices = (0..record.len()).collect();
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(hit) = self.pending.pop_front() {
+                return Some(Ok(hit));
             }
-            for &idx in &column_indices {
-                if idx >= record.len() {
-                    return Err(CsvCoincidenceError::InvalidColumnIndex(idx));
+            if self.exhausted {
+                return None;
+            }
+            let mut record = StringRecord::new();
+            match self.reader.read_record(&mut record) {
+                Ok(true) => {
+                    self.row += 1;
+                    match evaluate_row_hits(
+                        &record,
+                        &self.headers,
+                        self.row,
+                        &self.rules,
+                        self.logic,
+                        true,
+                    ) {
+                        Ok(hits) => self.pending.extend(hits),
+                        Err(err) => {
+                            self.exhausted = true;
+                            return Some(Err(err));
+                        }
+                    }
                 }
-            }
-        } else {
-            for &idx in &column_indices {
-                if idx >= record.len() {
-                    return Err(CsvCoincidenceError::InvalidColumnIndex(idx));
-                }
-            }
-        }
-
-        for &col_idx in &column_indices {
-            let value = record.get(col_idx).unwrap_or("");
-            for pattern in &patterns {
-                if let Some(score) = field_matches(value, pattern, options) {
-                    hits.push(MatchHit {
-                        row: row_idx + 1,
-                        column_index: col_idx,
-                        column_name: headers.get(col_idx).map(|s| s.to_string()),
-                        value: value.to_string(),
-                        pattern: pattern.raw.clone(),
-                        score: match options.mode {
-                            MatchMode::Fuzzy { .. } => Some(score),
-                            _ => None,
-                        },
-                    });
+                Ok(false) => self.exhausted = true,
+                Err(err) => {
+                    self.exhausted = true;
+                    return Some(Err(err.into()));
                 }
             }
         }
     }
-
-    Ok(hits)
 }
 
-/// Count matching fields.
+/// Stream matches from any CSV reader.
+pub fn find_matches_reader<R: Read>(
+    reader: Reader<R>,
+    options: &SearchOptions,
+) -> Result<Vec<MatchHit>> {
+    find_matches_iter_reader(reader, options)?.collect()
+}
+
+/// Count matching fields without materialising the hits.
 pub fn count_matches_reader<R: Read>(reader: Reader<R>, options: &SearchOptions) -> Result<usize> {
-    Ok(find_matches_reader(reader, options)?.len())
+    let mut count = 0usize;
+    for hit in find_matches_iter_reader(reader, options)? {
+        hit?;
+        count += 1;
+    }
+    Ok(count)
 }
 
-/// Keep or drop rows based on whether they contain matches.
-pub fn filter_rows_reader<R: Read>(
+/// Keep or drop rows based on matches, writing to `writer`.
+/// Returns the number of data rows written.
+pub fn filter_rows_to_writer<R: Read, W: Write>(
     mut reader: Reader<R>,
     options: &SearchOptions,
     keep_matches: bool,
-) -> Result<String> {
-    let patterns = compile_patterns(options)?;
-    let headers = if options.csv.has_headers {
-        reader.headers()?.clone()
-    } else {
-        StringRecord::new()
-    };
-
-    let mut column_indices = if options.csv.has_headers {
-        resolve_column_indices(&headers, &options.columns)?
-    } else {
-        match &options.columns {
-            ColumnSelector::All => Vec::new(),
-            ColumnSelector::Indices(indices) => indices.clone(),
-            ColumnSelector::Names(_) => {
-                return Err(CsvCoincidenceError::Message(
-                    "column names require headers".into(),
-                ));
-            }
-        }
-    };
-
-    let mut wtr = WriterBuilder::new()
-        .delimiter(options.csv.delimiter)
-        .quote(options.csv.quote)
-        .from_writer(Vec::new());
+    writer: W,
+) -> Result<usize> {
+    let headers = read_headers(&mut reader, options)?;
+    let rules = compile_rules(options, &headers)?;
+    let mut wtr = build_writer(writer, options);
 
     if options.csv.has_headers {
         wtr.write_record(&headers)?;
     }
 
+    let mut written = 0usize;
     for result in reader.records() {
         let record = result?;
-        if !options.csv.has_headers {
-            if let ColumnSelector::All = options.columns {
-                column_indices = (0..record.len()).collect();
-            }
-        }
-
-        let mut row_matches = false;
-        for &col_idx in &column_indices {
-            if col_idx >= record.len() {
-                continue;
-            }
-            let value = record.get(col_idx).unwrap_or("");
-            for pattern in &patterns {
-                if field_matches(value, pattern, options).is_some() {
-                    row_matches = true;
-                    break;
-                }
-            }
-            if row_matches {
-                break;
-            }
-        }
-
-        if row_matches == keep_matches {
+        if evaluate_row_bool(&record, &rules, options.logic) == keep_matches {
             wtr.write_record(&record)?;
+            written += 1;
         }
     }
-
-    writer_to_string(wtr)
+    wtr.flush()?;
+    Ok(written)
 }
 
-/// Replace matching fields and optionally keep only touched rows.
-pub fn replace_matches_reader<R: Read>(
+/// Keep or drop rows based on whether they contain matches.
+pub fn filter_rows_reader<R: Read>(
+    reader: Reader<R>,
+    options: &SearchOptions,
+    keep_matches: bool,
+) -> Result<String> {
+    let mut buffer = Vec::new();
+    filter_rows_to_writer(reader, options, keep_matches, &mut buffer)?;
+    Ok(String::from_utf8(buffer)?)
+}
+
+/// Replace matching fields, writing to `writer`.
+/// Returns the number of data rows written.
+pub fn replace_matches_to_writer<R: Read, W: Write>(
     mut reader: Reader<R>,
     options: &ReplaceOptions,
-) -> Result<String> {
-    let patterns = compile_patterns(&options.search)?;
-    let headers = if options.search.csv.has_headers {
-        reader.headers()?.clone()
-    } else {
-        StringRecord::new()
-    };
-
-    let mut column_indices = if options.search.csv.has_headers {
-        resolve_column_indices(&headers, &options.search.columns)?
-    } else {
-        match &options.search.columns {
-            ColumnSelector::All => Vec::new(),
-            ColumnSelector::Indices(indices) => indices.clone(),
-            ColumnSelector::Names(_) => {
-                return Err(CsvCoincidenceError::Message(
-                    "column names require headers".into(),
-                ));
-            }
-        }
-    };
-
-    let mut wtr = WriterBuilder::new()
-        .delimiter(options.search.csv.delimiter)
-        .quote(options.search.csv.quote)
-        .from_writer(Vec::new());
+    writer: W,
+) -> Result<usize> {
+    let headers = read_headers(&mut reader, &options.search)?;
+    let rules = compile_rules(&options.search, &headers)?;
+    let mut wtr = build_writer(writer, &options.search);
 
     if options.keep_headers && options.search.csv.has_headers {
         wtr.write_record(&headers)?;
     }
 
+    let mut written = 0usize;
     for result in reader.records() {
         let record = result?;
-        if !options.search.csv.has_headers {
-            if let ColumnSelector::All = options.search.columns {
-                column_indices = (0..record.len()).collect();
-            }
-        }
-
-        let mut out: Vec<String> = record.iter().map(|s| s.to_string()).collect();
+        let mut out: Vec<String> = record.iter().map(str::to_string).collect();
         let mut changed = false;
 
-        for &col_idx in &column_indices {
-            if col_idx >= out.len() {
-                continue;
-            }
-            let original = out[col_idx].clone();
-            for pattern in &patterns {
-                if let Some(replaced) =
-                    replace_field(&original, pattern, &options.search, &options.replacement)
-                {
-                    out[col_idx] = replaced;
-                    changed = true;
-                    break;
+        for rule in rules.iter().filter(|rule| !rule.negated) {
+            for col_idx in rule.indices_for(out.len()) {
+                if col_idx >= out.len() {
+                    continue;
+                }
+                let original = out[col_idx].clone();
+                for pattern in &rule.patterns {
+                    if let Some(replaced) = replace_field(
+                        &original,
+                        pattern,
+                        &rule.mode,
+                        rule.case_insensitive,
+                        &options.replacement,
+                    ) {
+                        out[col_idx] = replaced;
+                        changed = true;
+                        break;
+                    }
                 }
             }
         }
 
         if changed || !options.only_matched_rows {
             wtr.write_record(&out)?;
+            written += 1;
         }
     }
+    wtr.flush()?;
+    Ok(written)
+}
 
-    writer_to_string(wtr)
+/// Replace matching fields and optionally keep only touched rows.
+pub fn replace_matches_reader<R: Read>(
+    reader: Reader<R>,
+    options: &ReplaceOptions,
+) -> Result<String> {
+    let mut buffer = Vec::new();
+    replace_matches_to_writer(reader, options, &mut buffer)?;
+    Ok(String::from_utf8(buffer)?)
 }
 
 /// Build a summary report from matches.
@@ -463,137 +645,95 @@ pub fn scan_stats_reader<R: Read>(
     mut reader: Reader<R>,
     options: &SearchOptions,
 ) -> Result<(Vec<MatchHit>, usize, usize)> {
-    let patterns = compile_patterns(options)?;
-    let headers = if options.csv.has_headers {
-        reader.headers()?.clone()
-    } else {
-        StringRecord::new()
-    };
-
-    let mut column_indices = if options.csv.has_headers {
-        resolve_column_indices(&headers, &options.columns)?
-    } else {
-        match &options.columns {
-            ColumnSelector::All => Vec::new(),
-            ColumnSelector::Indices(indices) => indices.clone(),
-            ColumnSelector::Names(_) => {
-                return Err(CsvCoincidenceError::Message(
-                    "column names require headers".into(),
-                ));
-            }
-        }
-    };
+    let headers = read_headers(&mut reader, options)?;
+    let rules = compile_rules(options, &headers)?;
 
     let mut hits = Vec::new();
     let mut total_rows = 0usize;
     let mut total_fields = 0usize;
 
-    for (row_idx, result) in reader.records().enumerate() {
-        let record = result?;
+    let mut record = StringRecord::new();
+    while reader.read_record(&mut record)? {
         total_rows += 1;
-        if !options.csv.has_headers {
-            if let ColumnSelector::All = options.columns {
-                column_indices = (0..record.len()).collect();
-            }
+        for rule in &rules {
+            total_fields += rule
+                .indices_for(record.len())
+                .iter()
+                .filter(|&&idx| idx < record.len())
+                .count();
         }
-
-        for &col_idx in &column_indices {
-            if col_idx >= record.len() {
-                continue;
-            }
-            total_fields += 1;
-            let value = record.get(col_idx).unwrap_or("");
-            for pattern in &patterns {
-                if let Some(score) = field_matches(value, pattern, options) {
-                    hits.push(MatchHit {
-                        row: row_idx + 1,
-                        column_index: col_idx,
-                        column_name: headers.get(col_idx).map(|s| s.to_string()),
-                        value: value.to_string(),
-                        pattern: pattern.raw.clone(),
-                        score: match options.mode {
-                            MatchMode::Fuzzy { .. } => Some(score),
-                            _ => None,
-                        },
-                    });
-                }
-            }
-        }
+        hits.extend(evaluate_row_hits(
+            &record,
+            &headers,
+            total_rows,
+            &rules,
+            options.logic,
+            false,
+        )?);
     }
 
     Ok((hits, total_rows, total_fields))
 }
 
-/// Deduplicate rows that share the same fingerprint of matched column values.
-pub fn dedupe_rows_reader<R: Read>(
+/// Deduplicate rows, writing to `writer`.
+/// Returns the number of data rows written.
+pub fn dedupe_rows_to_writer<R: Read, W: Write>(
     mut reader: Reader<R>,
     options: &SearchOptions,
-) -> Result<String> {
-    let patterns = compile_patterns(options)?;
-    let headers = if options.csv.has_headers {
-        reader.headers()?.clone()
-    } else {
-        StringRecord::new()
-    };
-
-    let mut column_indices = if options.csv.has_headers {
-        resolve_column_indices(&headers, &options.columns)?
-    } else {
-        match &options.columns {
-            ColumnSelector::All => Vec::new(),
-            ColumnSelector::Indices(indices) => indices.clone(),
-            ColumnSelector::Names(_) => {
-                return Err(CsvCoincidenceError::Message(
-                    "column names require headers".into(),
-                ));
-            }
-        }
-    };
-
-    let mut wtr = WriterBuilder::new()
-        .delimiter(options.csv.delimiter)
-        .quote(options.csv.quote)
-        .from_writer(Vec::new());
+    writer: W,
+) -> Result<usize> {
+    let headers = read_headers(&mut reader, options)?;
+    let rules = compile_rules(options, &headers)?;
+    let mut wtr = build_writer(writer, options);
 
     if options.csv.has_headers {
         wtr.write_record(&headers)?;
     }
 
     let mut seen: HashSet<String> = HashSet::new();
+    let mut written = 0usize;
 
     for result in reader.records() {
         let record = result?;
-        if !options.csv.has_headers {
-            if let ColumnSelector::All = options.columns {
-                column_indices = (0..record.len()).collect();
-            }
-        }
-
         let mut key_parts = Vec::new();
-        let mut any_match = false;
-        for &col_idx in &column_indices {
-            let value = record.get(col_idx).unwrap_or("");
-            for pattern in &patterns {
-                if field_matches(value, pattern, options).is_some() {
-                    any_match = true;
+        let mut seen_columns: HashSet<usize> = HashSet::new();
+        for rule in rules.iter().filter(|rule| !rule.negated) {
+            for col_idx in rule.indices_for(record.len()) {
+                if seen_columns.contains(&col_idx) {
+                    continue;
+                }
+                let Some(value) = record.get(col_idx) else {
+                    continue;
+                };
+                if rule.patterns.iter().any(|pattern| {
+                    field_match(value, pattern, &rule.mode, rule.case_insensitive).is_some()
+                }) {
+                    seen_columns.insert(col_idx);
                     key_parts.push(format!("{col_idx}:{value}"));
-                    break;
                 }
             }
         }
 
-        let key = if any_match {
-            key_parts.join("|")
-        } else {
+        let key = if key_parts.is_empty() {
             record.iter().collect::<Vec<_>>().join("\u{1f}")
+        } else {
+            key_parts.join("|")
         };
 
         if seen.insert(key) {
             wtr.write_record(&record)?;
+            written += 1;
         }
     }
+    wtr.flush()?;
+    Ok(written)
+}
 
-    writer_to_string(wtr)
+/// Deduplicate rows that share the same fingerprint of matched column values.
+pub fn dedupe_rows_reader<R: Read>(reader: Reader<R>, options: &SearchOptions) -> Result<String> {
+    let mut buffer = Vec::new();
+    dedupe_rows_to_writer(reader, options, &mut buffer)?;
+    Ok(String::from_utf8(buffer)?)
 }
 
 pub fn write_output(path: Option<&Path>, content: &str) -> Result<()> {

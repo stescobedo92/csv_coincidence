@@ -6,12 +6,16 @@ Search, count, filter, replace, and report pattern matches inside CSV files.
 
 ## Features
 
-- Find matches with **row / column context**
-- Count occurrences across one or more patterns
+- Find matches with **row / column context**, matched fragment, byte span, and regex capture groups
+- **Streaming API**: iterate hits record by record, write filter/replace/dedupe output to any `Write`
+- Count occurrences across one or more patterns (without materialising hits)
 - Filter rows that match (or invert the filter)
 - Replace matches with custom text or regex capture groups (`$1`, `$2`, …)
 - Merge helper that replaces matches with `[MERGED]`
 - Column targeting by **name** or **index**
+- **Per-column rules** combined with AND / OR / NOT (`--where '[!]column=pattern'`)
+- **Built-in PII patterns** (email, IBAN, credit-card, DNI, NIE, phone-es, url, ipv4, date-iso, uuid) with exact validators (Luhn, IBAN mod-97, DNI/NIE control letter)
+- Load patterns from a **file** (`--pattern-file`, `#` comments allowed)
 - CSV dialect options: delimiter, headers, quote, trim
 - Fuzzy matching (normalized Levenshtein)
 - Deduplicate rows by matched-column fingerprints
@@ -26,7 +30,7 @@ Search, count, filter, replace, and report pattern matches inside CSV files.
 
 ```toml
 [dependencies]
-csv_coincidence = { version = "0.2", default-features = false }
+csv_coincidence = { version = "0.3", default-features = false }
 ```
 
 ### CLI
@@ -52,6 +56,13 @@ csv-coincidence count -i data.csv -p '@example\.com' -c email
 
 # Keep matching rows
 csv-coincidence filter -i data.csv -p 'Madrid' -c city
+
+# Per-column rules: example.com addresses NOT in Madrid
+csv-coincidence filter -i data.csv --where 'email=@example\.com' --where '!city=Madrid'
+
+# Built-in patterns and pattern files
+csv-coincidence find -i data.csv --builtin email --builtin iban -f json
+csv-coincidence report -i data.csv --pattern-file patterns.txt -f text
 
 # Replace / redact
 csv-coincidence replace -i data.csv -p '@.*' -c email -r '[REDACTED]'
@@ -85,6 +96,32 @@ fn main() -> csv_coincidence::Result<()> {
             hit.column_name.as_deref().unwrap_or("?"),
             hit.value
         );
+    }
+    Ok(())
+}
+```
+
+### Streaming and per-column rules
+
+```rust
+use csv_coincidence::{
+    find_matches_iter, ColumnRule, ColumnSelector, LogicOp, SearchOptions,
+};
+
+fn main() -> csv_coincidence::Result<()> {
+    // Rows in Madrid whose name is not Jhon, streamed hit by hit.
+    let options = SearchOptions::with_rules(
+        [
+            ColumnRule::new(ColumnSelector::Names(vec!["city".into()]), ["Madrid"]),
+            ColumnRule::new(ColumnSelector::Names(vec!["name".into()]), ["Jhon"])
+                .negated(true),
+        ],
+        LogicOp::And,
+    );
+
+    for hit in find_matches_iter("data.csv", options)? {
+        let hit = hit?;
+        println!("{}..{} {:?}", hit.start, hit.end, hit.matched_text);
     }
     Ok(())
 }
